@@ -1,0 +1,14 @@
+.env
+*.db
+*.jpg
+*.jpeg
+*.png
+*.pt
+*.onnx
+*.npz
+calib_images/
+current_position.json
+current_position.json.tmp
+live_scene.json
+__pycache__/
+*.pyc
