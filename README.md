@@ -2,7 +2,7 @@
 
 A single-camera system that works out where the camera is, remembers where it saw objects and people, and guides you with spoken directions and obstacle warnings. It is a pilot built for blind users who carry a phone in a front pocket with the camera facing forward. This file is the only documentation in the repo.
 
-**Pilot, not a safety device.** It is advisory only. Do not rely on it to avoid danger. Positions are approximate (about 1 m) and it only knows what the camera has already seen.
+**Pilot, not a safety device.** It is advisory only. Do not rely on it to avoid danger. Accuracy has not been measured yet (the pilot target is about 1 m), and it only knows what the camera has already seen.
 
 From one webcam (or a phone) it can:
 
@@ -21,6 +21,11 @@ From one webcam (or a phone) it can:
 | Question | Decision |
 |---|---|
 | Sound | Spoken warnings and voice questions only (section 1.6). |
+| Amount of speech | Keep it limited: one short line with the object name and distance, then silence. **Decided, not yet implemented.** |
+| Consent | Faces are of friends, for pilot testing only. Data stays local and is archived when the pilot ends (see Privacy). |
+| Tracking | Expected to stay weak in the pilot. Scan carefully with clear corners and rely on the saved maps. |
+| Identical rooms | Test at least 2 pairs of look-alike rooms (section 5). |
+| Motion sensors | The phone's motion sensors should be used, starting with a learning mode and then a scale calibration. **Decided, not yet implemented.** |
 | Obstacles | Approved as built. One addition: memory of people's names and who they are (section 1.7). |
 | What "1 m" means | What comes next within about 1 m in a straight line in front of the camera, relative to the camera's rotation and angle. |
 | Camera | The webcam for development. The target user is a blind person with the phone in a front pocket, camera facing out. |
@@ -252,22 +257,52 @@ python selftest.py
 ```
 It takes a few minutes. It builds a synthetic room with a virtual camera that turns and swings, runs the tracker, and checks the result against the truth. It passes when the final status is `tracking`, path error is under 6% of path length, heading error is under 8 degrees and the median map error is under 0.4 units. It then checks the logic: saved keyframes are loaded and recognised in a new run, a different room is rejected, short losses recover without a new session, a long loss starts a new world frame, objects are placed on the object and not the wall behind it, repeat sightings merge into one row, directions and obstacle warnings are right, people can be remembered, recognised (with stand-in faces) and forgotten, and `what is ahead` lists the right things. It uses temporary files, so your database and position file are never touched. It uses random noise, so a run that misses a limit by a hair can happen. Run it again before assuming something is broken.
 
-**What has been tested:** everything above on the simulated room, plus rendered video through `live_run.py` and the phone web pipeline end to end with simulated frames.
+### Results so far (pilot, one developer, one room, webcam plus one Android phone)
 
-**Not yet tested on real hardware:** the accuracy against a tape in a real room, the saved-map join across two real runs, the spoken output and voice input on a real computer, a real Android phone in a pocket, and real face recognition (the model download and recognising a real face). To check accuracy: place two objects a measured distance apart, scan both in one session with `set_scale.py` run in that session, then run `python check_accuracy.py ID1 ID2 TAPE_METERS`.
+Anything not listed here has **not been measured**. Scale values from different sessions cannot be compared with each other.
+
+| Test | Result | Status |
+|---|---|---|
+| `selftest.py` (simulated room) | Passed twice. Turn heading error 2.0 degrees, swing 1.4 degrees. | Measured |
+| Saved-map join across runs | Joined in some runs (sessions 24 and 30) and not in others (the session 32 map, `--map 30`). Latest round: 1 join in 3 tries. | Measured, unreliable |
+| Tracking on a slow 90 degree pan | Session 32 reached 7,943 map points. Lost 3 times and recovered each time without starting a new session. | Measured |
+| Tracking while moving the laptop by hand (sessions 28 to 30) | Many lost events. | Measured, weak |
+| Face learning | "Learned the face of Ahmed" worked with the real models. Recognition rate not measured. | Partly measured |
+| `navigate.py`, `view_memory.py`, `voice.py` (typed input) | Work. | Measured |
+| Phone (Android Chrome) | Connected and tracked, 6,804 map points, TV, laptop and keyboard saved, voice commands reached the server (one "what is head" was misheard). Spoken output and vibration are not confirmed. | Partly measured |
+| Scale (tape or A4 sheets) | Recent values: 0.304 (session 24), 0.369 (session 30), 1.691 (session 36), 1.332 (session 38). Three times the tracker did not follow the movement ("0.014 map units registered for 0.5 m"). | Measured, inconsistent |
+| **Accuracy against a tape** | The only attempt was invalid (wrong object pair, no real tape, objects at different heights). | **Not measured** |
+| Scale repeatability (3 runs in one session) | | **Not measured** |
+| Identical-room false joins | | **Not measured** |
+| Face recognition hit and miss rate | | **Not measured** |
+| Phone: spoken output, vibration, 3 minute pocket walk | | **Not measured** |
+| Obstacle warning hits, misses and false alarms | | **Not measured** |
+
+**Planned tests and pass bars:**
+
+1. **Scale repeatability:** 3 runs of `set_scale.py` in one session with 0.594 m (2 A4 sheets). All three within 20% of each other.
+2. **Accuracy:** 6 object pairs over 2 sessions, objects at the same height, measured with `check_accuracy.py`. Every error under 1.0 m.
+3. **Saved-map join:** 3 tries, at least 2 must print "Found the saved map".
+4. **Identical rooms:** a run in room A2 must **not** join the saved map of room A1 (zero false joins), and `--map N` must join the right room. Repeat with pair B.
+5. **Faces (with the friends' permission):** at least 8 of 10 correct in normal light and zero names given to a stranger.
+6. **Phone:** spoken output (voice box on, media volume full), vibration near an obstacle, a 3 minute slow walk with the phone in a pocket, and a count of lost events.
+
+A real tape check: use A4 sheets, long side 29.7 cm (1 sheet = 0.297 m, 2 = 0.594 m, 3 = 0.891 m, 5 = 1.485 m). Run `python check_accuracy.py ID1 ID2 TAPE_METERS` on two objects at the same height.
 
 ---
 
 ## 6. Known limitations
 
-- **Accuracy is about 1 m at best**, which matches the pilot target. A single camera's depth is rough, and farther objects have noisier positions. A depth-capable device (for example an iPhone with LiDAR) would improve this at the source.
+- **Accuracy has not been measured.** About 1 m is the pilot target, not a result. A single camera's depth is rough, and farther objects have noisier positions. A depth-capable device (for example an iPhone with LiDAR) would improve this at the source.
 - **Drift.** There is no loop closure or bundle adjustment. Recognising a saved view corrects the position, but heading and scale can still drift slowly during long scans.
 - **Fast motion and blur** cause `lost`. Move slowly, and use a well-lit room with texture.
 - **A map is recognised only if the place looks similar.** Moving furniture or changing light can stop a later run from joining the old map. It then starts a new session.
 - **Different cameras do not share maps.** A map made with the webcam is not used by the phone, and the reverse.
 - **Object positions are approximate**, and objects of the same label within about 0.75 m are merged into one.
 - **Obstacle warnings only cover objects the camera has already seen**, and only the obstacle-sized classes. They are advisory, not a safety system.
-- **Detection is only as good as YOLOv8n.** Wrong labels still happen, even at confidence 0.6.
+- **Detection is only as good as YOLOv8n.** Wrong labels still happen, even at confidence 0.6 (for example bed, dog or couch), and one object can get several labels.
+- **Speech can hang.** In `voice.py`, a long line made the PowerShell speech stop for about 60 seconds. Not fixed yet.
+- **Saved-map joins are unreliable** so far (1 of 3 in the latest round), and there is no measured false-join rate for look-alike rooms.
 - **Scale is only rough without a measurement.** A blind user cannot use a tape, so a helper should run `set_scale.py` first. Without it the default (5 map units per meter) can be up to about 2 times off, which moves the 1 m warning distance.
 - **Walking and a pocket are hard for the tracker:** shaking, a low viewpoint and clothing that may cover the lens cause `lost`. Warnings stop while tracking is lost, and the phone says so.
 - **Face recognition can be wrong or miss**, especially in poor light, side views or from far away.
@@ -294,6 +329,8 @@ It takes a few minutes. It builds a synthetic room with a virtual camera that tu
 
 ## 8. Roadmap
 
+- Limited speech: one short line with the object name and distance, then silence, plus a timeout so speech can never hang.
+- A learning mode that uses the phone's motion sensors, then a scale calibration. The accelerometer drifts and a pocket shakes, so it must be compared against a tape.
 - Measure accuracy against a tape in a real room and report it here.
 - Test the join across two real runs and the phone pipeline on real devices.
 - A scale that needs no tape measure (for example from the phone's motion sensors or known object sizes), so a blind user can use it alone.
@@ -302,4 +339,4 @@ It takes a few minutes. It builds a synthetic room with a virtual camera that tu
 - Anything beyond the phone is for the client to build.
 
 ## Privacy
-Face samples are only of friends who agreed, for pilot testing. They stay in the local database (never in git). When the pilot ends, the data is archived locally.
+Face samples are only of friends who agreed, for pilot testing. They stay in the local database (never in git). When the pilot ends, the data is archived locally. `forget NAME` removes a person's name and face. The repo ignores `.env`, databases, images, model files, calibration images and live position files (see `.gitignore`), so keys, photos and face data are never committed.

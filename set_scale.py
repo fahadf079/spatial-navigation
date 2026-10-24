@@ -1,7 +1,7 @@
 """Give the current session a real-world scale.
 
 live_run.py must be RUNNING in another terminal while you use this, and both terminals must be
-inside the project folder (cd C:\\Users\\fahad\\spatial-navigation).
+inside the project folder (cd path\\to\\spatial-navigation).
 
 Use a SHORT, measured move (for example 0.3 m along a tape measure). Long walks make the
 tracker lose its place, and a scale from a lost run is wrong.
