@@ -6,6 +6,7 @@ camera's current rotation and angle (the pilot is a phone in a front pocket look
 Positions are approximate (the pilot target is about 1 m), so answers say so.
 Everything here only reads the database and the live files.
 """
+import datetime
 import math
 import re
 
@@ -20,6 +21,8 @@ CORRIDOR_METERS = 0.5      # an object this close to the straight path is an obs
 END_MARGIN_METERS = 0.3    # ignore things right next to the target itself
 ALERT_METERS = 1.0         # "ahead" means within about 1 m in a straight line
 ALERT_FOV_DEG = 25         # ... for objects this close to straight ahead
+LIMITED_SPEECH = True      # spoken answers are one short line (object and distance); the full text is still printed
+POSITION_MAX_AGE_SECONDS = 4.0   # a position older than this means the camera program is not running
 
 # Objects big enough to be in the way (COCO labels).
 OBSTACLE_LABELS = {
@@ -45,6 +48,27 @@ SYNONYMS = {
     'cellphone': 'phone', 'smartphone': 'phone', 'fridge': 'refrigerator', 'bike': 'bicycle',
     'plant': 'plant', 'desk': 'table', 'notebook': 'laptop', 'computer': 'laptop',
 }
+
+
+def one_line(text, max_words=14):
+    """The first sentence of a long answer (two if the first is only 'OK.'), at most max_words words."""
+    sentences = [x.strip() for x in re.split(r'(?<=[.!?])\s+', ' '.join(str(text).split())) if x.strip()]
+    if not sentences:
+        return ''
+    out = sentences[0]
+    if len(out.split()) <= 2 and len(sentences) > 1:
+        out += ' ' + sentences[1]
+    words = out.split()
+    return ' '.join(words[:max_words]).rstrip(',;:') + ('' if len(words) <= max_words else '.')
+
+
+def _cap(text):
+    return text[:1].upper() + text[1:]
+
+
+def warning_line(name, meters):
+    """The one spoken line for an obstacle warning: the object and its distance, nothing else."""
+    return f'{_cap(name)} ahead, {meters:.1f} meters'
 
 
 def _singular(word):
@@ -180,10 +204,15 @@ def describe(query, conn=None):
     own = conn is None
     conn = conn or connect()
     try:
-        return _describe(query, conn)
+        answer = _describe(query, conn)
     finally:
         if own:
             conn.close()
+    full = answer.get('spoken', '')
+    answer['spoken_full'] = full
+    if LIMITED_SPEECH:                               # one short line, then silence
+        answer['spoken'] = answer.get('short') or one_line(full)
+    return answer
 
 
 def _describe(query, conn):
@@ -200,12 +229,35 @@ def _describe(query, conn):
     return _to_object(conn, query)
 
 
+def position_age(pos):
+    """Seconds since the position was written, or None if it has no usable time stamp."""
+    try:
+        return (datetime.datetime.now() - datetime.datetime.fromisoformat(pos['timestamp'])).total_seconds()
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
 def _position_or_message(conn):
     pos = read_position()
-    if pos is None:
+    age = position_age(pos) if pos is not None else None
+    if pos is None or age is None or age > POSITION_MAX_AGE_SECONDS:
+        # No position, or an old one left behind by a camera program that has stopped: never answer from it.
         msg = 'The camera is not running, so I cannot say where you are. Start live_run.py first.'
-        return None, {'found': False, 'text': msg, 'spoken': msg}
+        return None, {'found': False, 'text': msg, 'spoken': msg, 'short': 'Camera is not running.'}
     return pos, None
+
+
+def _not_tracking(pos):
+    """The tracker has lost its place: its position is stale, so give no directions and list nothing."""
+    status = pos.get('status')
+    text = (f"Tracking is not working right now (status: {status}), so I cannot give your position or say what "
+            'is ahead. Hold still and look back at a place you scanned.')
+    short = 'Tracking lost.' if status == 'lost' else 'Tracking is not ready.'
+    return {'found': False, 'text': text, 'spoken': short, 'short': short, 'tracking': False}
+
+
+def _spoken_distance(dist_units, scale, measured):
+    return ('' if measured else 'about ') + _dist_text(dist_units, scale)
 
 
 def _scale_note(measured):
@@ -216,6 +268,8 @@ def _ahead(conn):
     pos, error = _position_or_message(conn)
     if error:
         return error
+    if pos.get('status') != 'tracking':
+        return _not_tracking(pos)
     session = pos['session_id']
     scale, measured = effective_scale(conn, session)
     R = np.array(pos['rotation'], float)
@@ -229,14 +283,13 @@ def _ahead(conn):
     if found:
         text = 'Within about 1 m ahead: ' + '; '.join(lines) + '.' + _scale_note(measured)
         say = 'Ahead: ' + '; '.join(spoken) + '.'
+        short = f'{_cap(found[0][0])}, {_spoken_distance(found[0][1], scale, measured)}.'
     else:
         text = ('Nothing known within about 1 m straight ahead. I only know what the camera has already seen.'
                 + _scale_note(measured))
         say = 'Nothing known within one meter ahead.'
-    if pos.get('status') != 'tracking':
-        text += f" Warning: tracking status is '{pos.get('status')}', so this may be out of date."
-        say += ' Warning: tracking is not working right now.'
-    return {'found': True, 'text': text, 'spoken': say}
+        short = 'Nothing known ahead.'
+    return {'found': True, 'text': text, 'spoken': say, 'short': short}
 
 
 def _to_person(conn, person):
@@ -250,7 +303,7 @@ def _to_person(conn, person):
         msg = (f'I have not seen {name} in this map.'
                + (f' Last seen {people.minutes_ago_text(when)}, in an earlier session, so I cannot give directions.'
                   if when else ''))
-        return {'found': False, 'text': msg, 'spoken': msg}
+        return {'found': False, 'text': msg, 'spoken': msg, 'short': f'Have not seen {name} here.'}
     x, y, z, ts = seen
     stale = ''
     if people.minutes_ago_text(ts) != 'just now':
@@ -268,7 +321,7 @@ def _to_object(conn, query):
         msg = f"I have not seen anything matching '{query}' yet."
         if names:
             msg += ' I know: ' + ', '.join(names) + '.'
-        return {'found': False, 'text': msg, 'spoken': msg}
+        return {'found': False, 'text': msg, 'spoken': msg, 'short': 'Not seen yet.'}
 
     pos, error = _position_or_message(conn)
     if error:
@@ -281,12 +334,14 @@ def _to_object(conn, query):
                'Each run has its own origin, so I cannot give a distance. Run live_run.py and look '
                'around to see it again.')
         spoken = f'I know the {old[1]}, but only from an earlier session. Look around to see it again.'
-        return {'found': False, 'text': msg, 'spoken': spoken}
+        return {'found': False, 'text': msg, 'spoken': spoken, 'short': 'Not seen in this map. Look around.'}
     id_, label, x, y, z, _, ts, source = current[0]
     return _directions(conn, pos, label, np.array([x, y, z], float), ts, id_)
 
 
 def _directions(conn, pos, label, X, ts, target_id, extra=''):
+    if pos.get('status') != 'tracking':
+        return _not_tracking(pos)
     session = pos['session_id']
     scale, measured = effective_scale(conn, session)
     horizontal, vertical, dist, C = _heading_and_angles(pos, X)
@@ -329,8 +384,6 @@ def _directions(conn, pos, label, X, ts, target_id, extra=''):
 
     spoken = f'{label[0].upper() + label[1:]}, {_dist_text(dist, scale)}. {direction}.'
     spoken = re.sub(r'\s*\(.*?\)', '', spoken) + ' ' + ' '.join(spoken_obs)
-    if pos.get('status') != 'tracking':
-        lines.append(f"Warning: tracking status is '{pos.get('status')}', so your position may be stale.")
-        spoken += ' Warning: tracking is not working right now.'
-    return {'found': True, 'text': '\n'.join(lines), 'spoken': spoken.strip(), 'label': label,
+    short = f'{_cap(label.split(",")[0])}, {_spoken_distance(dist, scale, measured)}.'
+    return {'found': True, 'text': '\n'.join(lines), 'spoken': spoken.strip(), 'short': short, 'label': label,
             'distance_units': dist, 'distance_m': dist / scale, 'turn_degrees': horizontal}

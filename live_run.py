@@ -23,6 +23,7 @@ scale) instead of starting a new session.
 Everything is saved to spatial_memory.db as it happens. Press q to quit.
 """
 import argparse
+import inspect
 import datetime
 import time
 
@@ -31,7 +32,7 @@ import numpy as np
 
 import faces
 import people
-from guidance import obstacles_ahead, side_text
+from guidance import obstacles_ahead, warning_line
 from sound import Speaker
 from tracker import (CALIB_FILE, LOST_FRAMES_BEFORE_RESEED, VisualOdometry, connect,
                      effective_scale, get_units_per_meter, latest_map_session, load_keyframes,
@@ -178,6 +179,17 @@ def draw_overlay(frame, vo, status, points_saved, detections_saved, boxes, bad_f
         cv2.putText(frame, message, (10, h - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.55, RED, 2)
 
 
+def _takes_speak(fn):
+    """True if the notify function accepts a speak=... argument (older ones take only the text)."""
+    if fn is None:
+        return False
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+    return 'speak' in params or any(p.kind == p.VAR_KEYWORD for p in params.values())
+
+
 def run(save_map=True, detect=True, source=0, show=True, max_frames=None, detector=None,
         conf=MIN_CONFIDENCE, dshow=False, ignore=IGNORE_LABELS, model='yolov8n.pt', resume='auto',
         K=None, state=None, notify=None, face_engine=None, use_faces=True):
@@ -230,7 +242,11 @@ def run(save_map=True, detect=True, source=0, show=True, max_frames=None, detect
     last_sample = 0.0
     live_objs, live_time = [], 0.0       # what the last detection pass saw (people included)
 
-    def event(text, key=None, gap=8.0):
+    notify_takes_speak = _takes_speak(notify)
+
+    def event(text, key=None, gap=8.0, speak=True):
+        """Send a short message. speak=False marks it as information to show but not say out loud
+        (limited speech: only warnings and answers are spoken)."""
         if notify is None:
             return
         key = key or text
@@ -238,7 +254,10 @@ def run(save_map=True, detect=True, source=0, show=True, max_frames=None, detect
         if now - last_event.get(key, 0) < gap:
             return
         last_event[key] = now
-        notify(text)
+        if not speak and notify_takes_speak:
+            notify(text, speak=False)
+        else:
+            notify(text)
 
     def get_engine():
         nonlocal engine, engine_failed
@@ -249,7 +268,7 @@ def run(save_map=True, detect=True, source=0, show=True, max_frames=None, detect
                 engine_failed = True
                 print(f'Face recognition is not available: {exc}')
                 event('Face recognition is not available. People can be remembered by name only.',
-                      'nofaces', 600)
+                      'nofaces', 600, speak=False)
         return engine
 
     while True:
@@ -301,7 +320,7 @@ def run(save_map=True, detect=True, source=0, show=True, max_frames=None, detect
                     scale_frame = frame_idx
                     print(f'Found the saved map of session {session_id}. Continuing in its coordinates'
                           + (f' ({saved_scale:.2f} map units per meter).' if saved_scale else '.'))
-                    event('Saved map found. Continuing where you left off.')
+                    event('Saved map found. Continuing where you left off.', speak=False)
             search_left -= 1
             if searching and search_left <= 0:
                 searching = False
@@ -319,7 +338,7 @@ def run(save_map=True, detect=True, source=0, show=True, max_frames=None, detect
                 buffered_kfs.clear()
                 print(f'The saved map was not recognised here. Starting a new map: session {session_id}. '
                       'Coordinates are only comparable inside this session.')
-                event('Saved map not recognised here. Starting a new map.')
+                event('Saved map not recognised here. Starting a new map.', speak=False)
         elif vo.generation != generation:
             # Tracking was lost for too long and no saved view matched, so the tracker started
             # a new world frame. Anything saved from now on must not be mixed with the old map.
@@ -328,14 +347,14 @@ def run(save_map=True, detect=True, source=0, show=True, max_frames=None, detect
             sessions_used.append(session_id)
             objects = []
             print(f'Tracking was lost for too long. New world frame: session {session_id} started.')
-            event('Tracking was lost for too long. Starting a new map.')
+            event('Tracking lost. New map started.')
         write_position(session_id, vo.R, vo.t, status)
         if status != last_status:
             print(f'Tracking status: {status}' + (f' ({vo.reason})' if status == 'lost' else ''))
             if status == 'lost':
-                event('Tracking lost. Move the camera back to the area you scanned.', 'lost', 10)
+                event('Tracking lost.', 'lost', 10)
             elif status == 'tracking' and last_status == 'lost':
-                event('Tracking restored.', 'restored', 5)
+                event('Tracking restored.', 'restored', 5, speak=False)
             last_status = status
 
         # Refresh what we know about people and the scale every second or so.
@@ -361,10 +380,8 @@ def run(save_map=True, detect=True, source=0, show=True, max_frames=None, detect
             alerts = obstacles_ahead(items, vo.position, vo.R, scale)
             if alerts:
                 name, dist, angle, kind = alerts[0]
-                side = side_text(angle)
-                text = (f'{name} ahead, {dist / scale:.1f} meters' if kind == 'person'
-                        else f'Obstacle ahead: {name}, {dist / scale:.1f} meters')
-                event(text + (f', {side}' if side else ''), f'obstacle-{name}', 6)
+                # limited speech: the object and its distance in one short line, no direction
+                event(warning_line(name, dist / scale), f'obstacle-{name}', 6)
 
         new_kfs = vo.drain_new_keyframes()
         new_points = np.empty((0, 3)) if relocated_now else vo.new_points
@@ -441,7 +458,7 @@ def run(save_map=True, detect=True, source=0, show=True, max_frames=None, detect
                     dist_m = float(np.linalg.norm(pos - vo.position)) / scale
                     if dist_m <= 3.0:
                         event(f'{name}' + (f', {people.speak_who(who)}' if who else '')
-                              + f' is about {dist_m:.1f} meters from you', f'seen-{pid}', 30)
+                              + f', {dist_m:.1f} meters', f'seen-{pid}', 30)
                 if pos is not None:
                     item = {'label': label, 'x': float(pos[0]), 'y': float(pos[1]), 'z': float(pos[2])}
                     if name:
@@ -466,7 +483,7 @@ def run(save_map=True, detect=True, source=0, show=True, max_frames=None, detect
                     continue
                 detections_saved += 1
                 print(f'Saved {label} ({conf:.2f}) at ({pos[0]:.1f}, {pos[1]:.1f}, {pos[2]:.1f}) [{source_kind}]')
-                event(f'{label} saved', f'saved-{label}', 15)
+                event(f'{label} saved', f'saved-{label}', 15, speak=False)
             live_time = time.time()
             write_live_scene(session_id, live_items)
 
@@ -521,7 +538,7 @@ if __name__ == '__main__':
     run(save_map=not args.no_map, detect=not args.no_detect,
         source=args.video if args.video else 0, conf=args.conf, dshow=args.dshow,
         model=args.model, resume='new' if args.new else (args.map if args.map else 'auto'),
-        notify=(lambda text, sp=Speaker(): sp.say(text, gap=0)) if args.speak else None,
+        notify=(lambda text, speak=True, sp=Speaker(): sp.say(text, gap=0) if speak else None) if args.speak else None,
         use_faces=not args.no_faces,
         ignore=() if args.ignore.strip().lower() == 'none'
         else tuple(x.strip() for x in args.ignore.split(',') if x.strip()))

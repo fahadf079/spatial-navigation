@@ -19,6 +19,10 @@ Endpoints:
     GET /pointcloud  map points of the newest session (?session=17&limit=5000)
     GET /navigate    answer a text query (?query=take me to the laptop)
     GET /events      state and messages of the phone pipeline
+
+Learning mode (phone): at the start the phone page asks you to walk about eight steps. The phone's
+motion sensors count the steps and the camera measures how far it moved, which sets the map scale
+without a tape measure (motion.py). Say "calibrate" later to do it again.
 """
 import argparse
 import collections
@@ -34,6 +38,7 @@ from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnec
 from fastapi.responses import HTMLResponse, PlainTextResponse
 
 import guidance
+import motion
 from tracker import connect, get_units_per_meter, read_position
 
 PHONE_FOCAL_FACTOR = 0.8   # focal length ~ 0.8 x the longer image side (typical phone main camera)
@@ -165,6 +170,23 @@ class FrameQueueSource:
         self.closed = True
 
 
+def _measured_scale(session_id):
+    conn = connect()
+    try:
+        return get_units_per_meter(conn, session_id)
+    finally:
+        conn.close()
+
+
+def _store_scale(session_id, units_per_meter):
+    conn = connect()
+    try:
+        conn.execute('UPDATE sessions SET units_per_meter = ? WHERE id = ?', (units_per_meter, session_id))
+        conn.commit()
+    finally:
+        conn.close()
+
+
 class PhonePipeline:
     """One live_run.py session fed by a phone, running in a background thread."""
 
@@ -174,20 +196,51 @@ class PhonePipeline:
         self.state = {'status': 'idle'}
         self.events = collections.deque(maxlen=50)
         self.next_event = 1
+        self._event_lock = threading.Lock()
         self.error = None
         self.resume = 'auto'       # continue the latest saved map if the phone recognises the place
+        self.learner = motion.LearningController(self.notify, read_position, _measured_scale, _store_scale)
 
     @property
     def running(self):
         return self.thread is not None and self.thread.is_alive()
 
-    def notify(self, text):
-        self.events.append((self.next_event, text))
-        self.next_event += 1
+    def notify(self, text, speak=True, learn=None):
+        """A short message for the phone. speak=False: show it but do not say it (limited speech).
+        learn: 'done', 'failed' or 'skipped' on the message that ends learning mode."""
+        with self._event_lock:
+            event = {'text': text, 'speak': bool(speak)}
+            if learn:
+                event['learn'] = learn
+            self.events.append((self.next_event, event))
+            self.next_event += 1
 
     def events_since(self, last_id):
-        items = [(i, t) for i, t in self.events if i > last_id]
-        return [t for _, t in items], (items[-1][0] if items else last_id)
+        items = [(i, e) for i, e in list(self.events) if i > last_id]
+        return [e for _, e in items], (items[-1][0] if items else last_id)
+
+    def handle_text(self, raw):
+        """A JSON text message from the phone: motion samples or a learning-mode command."""
+        msg = motion.parse_message(raw)
+        if msg is None:
+            return
+        kind = msg.get('type')
+        if kind == 'motion':
+            samples = msg.get('s')
+            if isinstance(samples, list):
+                self.learner.on_motion(samples[:200])
+        elif kind == 'learn':
+            action = msg.get('action')
+            if action == 'start':
+                if self.state.get('searching'):          # the session can still change when a saved map is found
+                    self.notify('Not ready. Still looking for the saved map.', True, 'failed')
+                    return
+                step = msg.get('step_m')
+                self.learner.start(step if isinstance(step, (int, float)) and not isinstance(step, bool) else None)
+            elif action == 'cancel':
+                self.learner.cancel()
+        elif kind == 'motion_unavailable':
+            self.learner.on_unavailable()
 
     def start(self, first_frame):
         import live_run                                     # heavy imports only when needed
@@ -197,6 +250,7 @@ class PhonePipeline:
         self.source = FrameQueueSource()
         self.state = {'status': 'starting'}
         self.error = None
+        self.learner.reset()
 
         def target():
             try:
@@ -216,6 +270,7 @@ class PhonePipeline:
         if self.thread is not None:
             self.thread.join(timeout=5)
         self.state = {'status': 'idle'}
+        self.learner.reset()
 
 
 PIPE = PhonePipeline()
@@ -241,7 +296,15 @@ async def camera(ws: WebSocket):
     last_event = 0
     try:
         while True:
-            data = await ws.receive_bytes()
+            message = await ws.receive()
+            if message.get('type') == 'websocket.disconnect':
+                break
+            if message.get('text') is not None:             # motion samples or a learning-mode command
+                PIPE.handle_text(message['text'])
+                continue
+            data = message.get('bytes')
+            if data is None:
+                continue
             frame = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
             if frame is None:
                 continue
@@ -252,6 +315,7 @@ async def camera(ws: WebSocket):
                 if PIPE.source.queue.qsize() == 0:
                     break
                 await asyncio.sleep(0.05)
+            PIPE.learner.tick()
             texts, last_event = PIPE.events_since(last_event)
             await ws.send_json({'state': PIPE.state, 'events': texts, 'error': PIPE.error})
     except WebSocketDisconnect:
@@ -280,9 +344,17 @@ video{width:100%;border-radius:8px;background:#000}
 <div id="cam" style="display:none">
   <video id="v" playsinline muted></video><canvas id="c" hidden></canvas>
   <div><button id="start">Start camera (pocket mode)</button><button id="stop" class="off">Stop</button></div>
-  <div class="note">Pilot test, not a safety device. Starting: the phone speaks, waits 10 seconds so you can put it in your front
-  pocket with the camera facing forward, then streams to the computer. Keep this page open; the screen stays on. Say a command, or hold
-  the black screen for 2 seconds to stop.</div>
+  <div class="note">Pilot test, not a safety device. Starting: with learning mode on, hold the phone in front of you and walk about
+  eight steps so the phone can set the map scale from its motion sensors (no tape needed). Then the phone speaks, waits 10 seconds so
+  you can put it in your front pocket with the camera facing forward, and streams to the computer. Keep this page open; the screen
+  stays on. Say a command (say "calibrate" to learn the scale again), or hold the black screen for 2 seconds to stop.</div>
+  <div class="note">
+    <label><input type="checkbox" id="learnmode" checked> Learning mode at start</label>
+    <label>Your height in cm (optional) <input type="text" id="height" inputmode="numeric" style="width:4em"></label>
+    <label><input type="checkbox" id="beep"> Beep on warnings</label>
+    <button id="alerttest" class="off">Test alert</button> <span id="rtt"></span>
+  </div>
+  <div id="lastmsg" class="note"></div>
   <div id="warn" class="lost"></div>
 </div>
 <div id="status">Waiting for data...</div>
@@ -300,11 +372,77 @@ video{width:100%;border-radius:8px;background:#000}
 <script>
 const CAMERA = __CAMERA__;
 const $ = id => document.getElementById(id);
-const COMMAND = /\b(where|take me|guide|find|who|what|remember|learn|forget|list|ahead|front|next|clear|anyone|anything|this person|stop)\b/i;
+const COMMAND = /\b(where|take me|guide|find|who|what|remember|learn|learning mode|calibrat\w*|forget|list|ahead|front|next|clear|anyone|anything|this person|stop)\b/i;
 let pocket = false, speaking = false, recog = null, wakeLock = null, ws = null, stream = null, running = false, stopping = false, lastSent = 0;
 
+let audioCtx = null, trackStatus = 'idle', trackSearching = false, learnActive = false, learnState = '', motionAvail = false, motionOn = false;
+let motionBuf = [], sentAt = 0, rttAvg = 0, rttMax = 0;
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+async function waitFor(test, ms){
+  const end = performance.now() + ms;
+  while(performance.now() < end){ if(test()) return true; await sleep(200); }
+  return test();
+}
+function ensureAudio(){
+  try{ audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)(); if(audioCtx.state === 'suspended') audioCtx.resume(); }catch(e){}
+}
+function beep(){
+  ensureAudio(); if(!audioCtx) return;
+  [0, 0.25].forEach(d => {
+    const o = audioCtx.createOscillator(), g = audioCtx.createGain(); o.frequency.value = 880; g.gain.value = 0.25;
+    o.connect(g); g.connect(audioCtx.destination); o.start(audioCtx.currentTime + d); o.stop(audioCtx.currentTime + d + 0.15);
+  });
+}
+function alertNow(){
+  if(navigator.vibrate){ navigator.vibrate([200, 100, 200]); }
+  if($('beep').checked) beep();
+}
+function handleEvent(ev){
+  const t = (typeof ev === 'string') ? ev : ev.text;
+  if(ev.learn){ learnState = ev.learn; }
+  $('lastmsg').textContent = t;
+  if(ev.speak === false) return;                       // limited speech: shown, not spoken
+  say(t, /ahead|obstacle|lost/i.test(t));
+}
+function onMotion(e){
+  const a = e.accelerationIncludingGravity;
+  if(!a || a.x === null || a.x === undefined) return;
+  motionAvail = true;
+  if(!learnActive) return;
+  motionBuf.push([Math.round(performance.now() * 10) / 10, +a.x.toFixed(3), +a.y.toFixed(3), +a.z.toFixed(3)]);
+  if(motionBuf.length >= 10) flushMotion();
+}
+function flushMotion(){
+  if(ws && ws.readyState === 1 && motionBuf.length){ ws.send(JSON.stringify({type:'motion', s: motionBuf})); }
+  motionBuf = [];
+}
+async function enableMotion(){
+  try{
+    if(typeof DeviceMotionEvent !== 'undefined' && typeof DeviceMotionEvent.requestPermission === 'function'){
+      const r = await DeviceMotionEvent.requestPermission();      // iPhone: must be asked inside the tap
+      if(r !== 'granted') return false;
+    }
+    if(!motionOn){ window.addEventListener('devicemotion', onMotion); motionOn = true; }
+    await waitFor(() => motionAvail, 1500);
+    return motionAvail;
+  }catch(e){ return false; }
+}
+function stepLength(){
+  const h = parseFloat($('height').value);
+  return (h > 100 && h < 230) ? +(0.415 * h / 100).toFixed(3) : null;      // null: the computer uses its default
+}
+async function startLearning(){
+  if(!ws || ws.readyState !== 1){ say('The camera is not running.'); return; }
+  if(!motionAvail && !(await enableMotion())){ ws.send(JSON.stringify({type:'motion_unavailable'})); return; }
+  learnState = 'running'; learnActive = true; motionBuf = [];
+  ws.send(JSON.stringify({type:'learn', action:'start', step_m: stepLength()}));
+  await waitFor(() => learnState !== 'running', 50000);
+  learnActive = false; flushMotion();
+  if(learnState === 'running' && ws && ws.readyState === 1){ ws.send(JSON.stringify({type:'learn', action:'cancel'})); }
+}
+
 function say(text, urgent){
-  if(urgent && navigator.vibrate){ navigator.vibrate([200, 100, 200]); }
+  if(urgent) alertNow();
   if(!$('voice').checked || !('speechSynthesis' in window)) return;
   if(urgent) speechSynthesis.cancel();
   const u = new SpeechSynthesisUtterance(text);
@@ -329,7 +467,7 @@ function startListening(){
 function stopListening(){ if(recog){ const r = recog; recog = null; try{ r.abort(); }catch(e){} } }
 
 function showState(s){
-  const st = s.status || 'idle';
+  const st = s.status || 'idle'; trackStatus = st; trackSearching = !!s.searching;
   $('status').innerHTML = 'Tracking: <b class="'+st+'">'+st+'</b>'
     + (s.x!==undefined ? ' &nbsp; X '+s.x.toFixed(1)+' Y '+s.y.toFixed(1)+' Z '+s.z.toFixed(1) : '')
     + (s.points!==undefined ? ' &nbsp; points '+s.points : '')
@@ -349,6 +487,7 @@ async function ask(text){
   text = (text || $('q').value).trim(); if(!text) return;
   $('q').value = text;
   if(/^(stop|stop listening|goodbye|stop camera)\W*$/i.test(text)){ say('Stopping.'); stopAll(); return; }
+  if(/\b(calibrat\w*|learning mode)\b/i.test(text)){ startLearning(); return; }
   try{
     const a = await (await fetch('/navigate?query='+encodeURIComponent(text))).json();
     $('answer').textContent = a.text; say(a.spoken, /warning|ahead/i.test(a.spoken) && /obstacle/i.test(a.spoken));
@@ -370,7 +509,7 @@ if(CAMERA){
     if(!running || !ws || ws.readyState !== 1) return;
     const v = $('v'), c = $('c'); c.width = v.videoWidth; c.height = v.videoHeight;
     c.getContext('2d').drawImage(v, 0, 0);
-    c.toBlob(b => { if(b && ws && ws.readyState === 1) ws.send(b); }, 'image/jpeg', 0.7);
+    c.toBlob(b => { if(b && ws && ws.readyState === 1){ sentAt = performance.now(); ws.send(b); flushMotion(); } }, 'image/jpeg', 0.7);
   }
   function connect(){
     ws = new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+'/ws/camera');
@@ -379,7 +518,11 @@ if(CAMERA){
       const m = JSON.parse(e.data);
       if(m.error){ $('warn').textContent = m.error; }
       if(m.state) showState(m.state);
-      (m.events || []).forEach(t => say(t, /ahead|obstacle|lost/i.test(t)));
+      if(sentAt){
+        const r = performance.now() - sentAt; rttAvg = rttAvg ? 0.8 * rttAvg + 0.2 * r : r; rttMax = Math.max(rttMax, r); sentAt = 0;
+        $('rtt').textContent = 'round trip ' + Math.round(rttAvg) + ' ms (max ' + Math.round(rttMax) + ')';
+      }
+      (m.events || []).forEach(handleEvent);
       const wait = Math.max(0, 90 - (performance.now() - lastSent)); lastSent = performance.now() + wait;
       setTimeout(sendFrame, wait);
     };
@@ -392,21 +535,50 @@ if(CAMERA){
   }
   function stopAll(){
     stopping = true; running = false; pocket = false; $('pocket').style.display = 'none';
+    learnActive = false; motionBuf = [];
+    if(motionOn){ window.removeEventListener('devicemotion', onMotion); motionOn = false; }
     stopListening(); if(ws) ws.close(); ws = null;
     if(stream) stream.getTracks().forEach(t => t.stop());
     if(wakeLock){ try{ wakeLock.release(); }catch(e){} wakeLock = null; }
   }
+  $('beep').checked = !navigator.vibrate;
+  $('alerttest').onclick = () => {
+    ensureAudio();
+    $('lastmsg').textContent = navigator.vibrate
+      ? (navigator.vibrate([300]) ? 'Vibration sent.' : 'Vibration was blocked by the browser.')
+      : 'Vibration is not supported by this browser (iPhone browsers cannot vibrate), so beeps are used.';
+    alertNow();
+  };
   $('start').onclick = async () => {
+    stopping = false; ensureAudio();
+    const wantLearn = $('learnmode').checked;
+    const gotMotion = wantLearn ? await enableMotion() : false;       // first thing in the tap: iPhones ask permission here
     try{
       stream = await navigator.mediaDevices.getUserMedia({video:{facingMode:'environment', width:{ideal:640}, height:{ideal:480}}, audio:false});
     }catch(e){ $('warn').textContent = 'Camera not available: '+e.message; return; }
     $('v').srcObject = stream; await $('v').play();
-    stopping = false;
-    say('Pilot test. This is not a safety device. Put the phone in your front pocket with the camera facing forward. Starting in ten seconds.', true);
-    await new Promise(r => setTimeout(r, 10000));
-    if(stopping) return;
-    running = true; connect(); enterPocket();
-    say('Started. Walk slowly. Ask what is ahead at any time.');
+    if(wantLearn && gotMotion){
+      say('Pilot test. This is not a safety device. Hold the phone in front of you, camera forward. Learning mode starts in five seconds.', true);
+      await sleep(5000);
+      if(stopping) return;
+      running = true; connect();
+      const ready = await waitFor(() => trackStatus === 'tracking' && !trackSearching, 45000);   // not while it still looks for the saved map
+      if(stopping) return;
+      if(ready){ await startLearning(); } else { say('Tracking did not start, so learning mode is skipped.'); }
+      if(stopping) return;
+      say('Now put the phone in your front pocket with the camera facing forward. Starting in ten seconds.', true);
+      await sleep(10000);
+      if(stopping) return;
+      enterPocket();
+      say('Started. Walk slowly. Ask what is ahead at any time.');
+    } else {
+      if(wantLearn) say('Motion sensors are not available, so learning mode is off.');
+      say('Pilot test. This is not a safety device. Put the phone in your front pocket with the camera facing forward. Starting in ten seconds.', true);
+      await sleep(10000);
+      if(stopping) return;
+      running = true; connect(); enterPocket();
+      say('Started. Walk slowly. Ask what is ahead at any time.');
+    }
   };
   $('stop').onclick = stopAll;
   let holdTimer = null;

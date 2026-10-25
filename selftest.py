@@ -277,17 +277,26 @@ def run_logic_checks():
             def release(self):
                 pass
 
-        messages = []
+        messages, flags = [], []
+
+        def collect(text, speak=True):
+            messages.append(text)
+            flags.append((text, speak))
+
         detector = lambda frame: [('chair', 0.9, (250., 150., 400., 330.)), ('person', 0.9, (100., 100., 300., 400.))]
         run_a = live_run.run(save_map=True, detect=True, source=Frames(view(0, 110, 4.0)), show=False,
-                             detector=detector, K=K, notify=messages.append)
+                             detector=detector, K=K, notify=collect)
         conn.execute('UPDATE sessions SET units_per_meter = 5.0 WHERE id = ?', (run_a,))
         conn.commit()
         run_b = live_run.run(save_map=True, detect=True, source=Frames(view(120, 100, 1.0)), show=False,
-                             detector=detector, K=K, notify=messages.append)
+                             detector=detector, K=K, notify=collect)
         ok &= check('a second run joins the first run\'s map and keeps its scale',
                     run_b == run_a and any('Saved map found' in m for m in messages),
                     f'first run session {run_a}, second run session {run_b}')
+        ok &= check('limited speech: "saved" and map messages are shown but not spoken',
+                    any('saved' in t and not sp for t, sp in flags)
+                    and all(not sp for t, sp in flags if 'Saved map found' in t or t.endswith(' saved')),
+                    f'{sum(1 for _, sp in flags if not sp)} quiet of {len(flags)} messages')
         labels = {r[0] for r in conn.execute('SELECT label FROM detections WHERE session_id = ?', (run_a,))}
         ok &= check('people are not saved as landmarks', labels == {'chair'}, f'saved: {sorted(labels)}')
 
