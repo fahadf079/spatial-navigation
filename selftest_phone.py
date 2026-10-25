@@ -147,14 +147,25 @@ def guidance_checks():
         check('the printed directions still have the turn and the obstacle',
               'Direction' in d['text'] and 'Obstacle' in d['text'])
         write_position(sid, np.diag([-1.0, 1.0, -1.0]), zero, 'tracking')
-        check('nothing ahead is said plainly, not as "clear"',
-              guidance.describe('what is ahead', conn)['spoken'] == 'Nothing known ahead.')
+        a = guidance.describe('what is ahead', conn)
+        check('the chair 80 cm behind you is still reported (warnings cover 360 degrees)',
+              a['spoken'] == 'Chair, 80 cm.' and 'behind you' in a['text'], repr(a['spoken']))
         write_position(sid, eye, zero, 'tracking')
+        conn.execute("DELETE FROM detections WHERE session_id = ?", (sid,))
+        conn.commit()
+        check('nothing within 1 m is said plainly, not as "clear"',
+              guidance.describe('what is ahead', conn)['spoken'] == 'Nothing known within one meter.')
+        for label, x, z in [('chair', 0.0, 4.0), ('laptop', 1.5, 10.0)]:
+            conn.execute("INSERT INTO detections (label, confidence, image_source, timestamp, x, y, z, session_id, "
+                         "pos_source) VALUES (?, 0.8, 'selftest', '2026-01-01T00:00:00', ?, 0, ?, ?, 'map')",
+                         (label, x, z, sid))
+        conn.commit()
 
         check('an obstacle warning is one short line: the object and its distance, no direction',
-              guidance.warning_line('chair', 0.8) == 'Chair ahead, 0.8 meters'
-              and guidance.warning_line('Ahmed, your brother', 0.65) == 'Ahmed, your brother ahead, 0.7 meters'
-              and 'left' not in guidance.warning_line('chair', 0.8))
+              guidance.warning_line('chair', 0.8) == 'Chair, 0.8 meters'
+              and guidance.warning_line('Ahmed, your brother', 0.65) == 'Ahmed, your brother, 0.7 meters'
+              and 'left' not in guidance.warning_line('chair', 0.8)
+              and 'ahead' not in guidance.warning_line('chair', 0.8))
         r = guidance.describe('remember this person as Ahmed, my friend', conn)
         check('people replies are one short line', 0 < len(r['spoken'].split()) <= 14 and r['spoken'] != 'OK.', repr(r['spoken']))
         check('one_line keeps "OK. ..." together and cuts very long sentences',
@@ -360,6 +371,16 @@ def server_checks():
         SKIPPED.append(f'phone server test: {exc.name} is not installed')
         print(f'  [skipped] {exc.name} is not installed')
         return
+    import collections
+    import threading
+    import types
+    import live_run
+    stub = types.SimpleNamespace(events=collections.deque(), next_event=0, _event_lock=threading.Lock())
+    api.PhonePipeline.notify(stub, 'Chair, 0.8 meters', alert=True)
+    api.PhonePipeline.notify(stub, 'Tracking restored.', speak=False)
+    check('an obstacle warning reaches the phone flagged as an alert (its spoken line has no "ahead" any more)',
+          live_run._takes_arg(api.PhonePipeline.notify, 'alert')
+          and stub.events[0][1].get('alert') is True and 'alert' not in stub.events[1][1], str(list(stub.events)))
     old = tracker.DB_PATH, tracker.POSITION_FILE, tracker.LIVE_SCENE_FILE
     tmp = tempfile.mkdtemp()
     tracker.DB_PATH = os.path.join(tmp, 'server.db')

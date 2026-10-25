@@ -11,7 +11,7 @@ From one webcam (or a phone) it can:
 3. **Remember** each object and where it was seen, in a SQLite database, saved as the camera runs.
 4. **Join separate runs:** the map is saved, so a later run that sees a place you scanned before continues in the same coordinates.
 5. **Guide you** to an object ("take me to the laptop") with a turn angle, a distance and a warning about obstacles on the way, by text and by voice.
-6. **Say what is ahead:** "what is ahead" lists what is within about 1 m in a straight line in front of the camera, people included.
+6. **Say what is within 1 m:** "what is ahead" lists everything known within about 1 m in any direction (a full 360 degrees), with left, right, ahead or behind you, people included.
 7. **Remember people:** their names and who they are ("Ahmed, my brother"), recognise them by face, and say when one is near.
 8. **Speak and listen:** warnings and answers are spoken, and questions can be asked by voice.
 9. **Build a 3D point cloud** of the room and plot it as a density heatmap.
@@ -27,7 +27,7 @@ From one webcam (or a phone) it can:
 | Identical rooms | Test at least 2 pairs of look-alike rooms (section 5). |
 | Motion sensors | The phone's motion sensors are used in a learning mode at the start, which sets the scale without a tape (section 3.6). **Implemented and tested on simulated walks only; not yet tested on a real phone.** |
 | Obstacles | Approved as built. One addition: memory of people's names and who they are (section 1.7). |
-| What "1 m" means | What comes next within about 1 m in a straight line in front of the camera, relative to the camera's rotation and angle. |
+| What "1 m" means | Anything known within about 1 m of the camera in **any direction (360 degrees)**, not only straight ahead. Updated from the first version, which only covered a straight line in front. The camera still only sees forward, see section 6. |
 | Camera | The webcam for development. The target user is a blind person with the phone in a front pocket, camera facing out. |
 | Phone trial | Android with Chrome, because it is the easiest (section 3.5). |
 | Separate runs | They are joined, so the map is saved and reused (section 1.3). |
@@ -69,12 +69,12 @@ A single camera cannot see real-world size. The first sideways movement of a map
 - **One row per object.** A repeat sighting of the same label within 0.75 m (once the scale is known) updates that row with the median of the sightings so far. Two objects with the same label closer than that are treated as one.
 
 ### 1.5 Guidance, "what is ahead" and obstacles (`guidance.py`)
-- **"Ahead"** means in a straight line in front of the camera, within about 1 m, within 25 degrees of the camera's forward direction. It follows the camera's rotation and angle, so for a phone in a pocket it is whatever the phone is facing.
+- **"Within 1 m"** means anything known within about 1 m (3D straight-line distance) of the camera, in **any direction (360 degrees)**: ahead, beside or behind. The direction word (straight ahead, slightly left, to the right, behind you) follows the camera's rotation, so for a phone in a pocket it is relative to where the phone is facing.
 - Your question is matched against the stored labels (whole phrases or single words, any case, plurals and a few synonyms such as "sofa" and "monitor").
 - It uses the newest match from the **current session** and gives a turn angle and distance relative to the camera's heading. If the object was only seen in an older session it says so.
 - **Obstacles:** stored objects of obstacle-sized classes (chair, couch, table, tv, plant, bed, laptop and similar) that stand within 0.5 m of the straight path to the target are reported with their distance and side.
-- **Live warning:** while running with sound, a large object or a person less than 1 m ahead is announced ("Obstacle ahead: chair, 0.8 meters"). People seen by the camera right now count, even strangers.
-- **"What is ahead":** say or type "what is ahead", "what is in front of me" or "is the way clear". The answer lists stored objects, remembered people seen a moment ago, and people the camera sees right now.
+- **Live warning:** while running with sound, a large object or a person less than 1 m away in any direction is announced (spoken as "Chair, 0.8 meters", with no direction word, as agreed). People seen by the camera right now count, even strangers.
+- **"What is ahead":** say or type "what is ahead", "what is in front of me" or "is the way clear". The answer lists stored objects, remembered people seen a moment ago, and people the camera sees right now, each with its direction.
 - **Scale:** distances need a scale. Without a measured one a rough default of 5 map units per meter is used, and answers say it is estimated. It can be up to about 2 times off, so measure it with `set_scale.py` when you can.
 - Every answer ends with a reminder that positions are approximate (about 1 m).
 
@@ -85,7 +85,7 @@ A single camera cannot see real-world size. The first sideways movement of a map
 - Sound here means spoken warnings and answers plus voice questions, as the project owner asked. Locating things by sound itself is not part of the pilot.
 
 **Limited speech.** Only one short line is spoken: the object and its distance (`Chair, 80 cm.`,
-`Chair ahead, 0.8 meters`) or a short warning (`Tracking lost.`). Everything else (`chair saved`, map messages,
+`Chair, 0.8 meters`) or a short warning (`Tracking lost.`). Everything else (`chair saved`, map messages,
 details) is printed or shown but not spoken. When no scale was measured the spoken distance says "about".
 `python voice.py --full` speaks the whole answer, and `guidance.LIMITED_SPEECH = False` turns limited speech off.
 
@@ -97,8 +97,8 @@ line. This was tested with stand-in processes; the Windows speech engine itself 
 **When tracking is lost, nothing stale is said.** "What is ahead" and directions say only `Tracking lost.` (or
 `Tracking is not ready.`) and give no objects or directions, because the last position can no longer be trusted. If the
 camera program has stopped (the position file is more than 4 seconds old) they say `Camera is not running.`
-People are not saved on the map, but "person ahead" warnings use people seen in the last 3 seconds (not yet tested with a
-real person walking ahead).
+People are not saved on the map, but live person warnings use people seen in the last 3 seconds (not yet tested with a
+real person walking nearby).
 
 ### 1.7 People memory (`people.py`, `faces.py`)
 Say or type:
@@ -165,7 +165,7 @@ python live_run.py
 | `--conf 0.5` | detection confidence (default 0.6) |
 | `--model yolov8s.pt` | a bigger, more accurate YOLO model (slower) |
 | `--ignore person,chair` | labels never saved (default `person`). `--ignore none` saves everything |
-| `--speak` | say warnings out loud (tracking lost, obstacle ahead, object saved) |
+| `--speak` | say warnings out loud (tracking lost, obstacle within 1 m, object saved) |
 | `--new` | do not look for the saved map; start a fresh one |
 | `--map 17` | continue the saved map of session 17 |
 | `--dshow` | open the webcam with DirectShow. Try this if the picture turns green or freezes on Windows |
@@ -301,7 +301,7 @@ python selftest_phone.py
 ```
 `selftest_phone.py` takes about 30 seconds and needs no camera. Its server and page checks are skipped, with a note, if `fastapi`/`httpx` or Node are not installed.
 
-It takes a few minutes. It builds a synthetic room with a virtual camera that turns and swings, runs the tracker, and checks the result against the truth. It passes when the final status is `tracking`, path error is under 6% of path length, heading error is under 8 degrees and the median map error is under 0.4 units. It then checks the logic: saved keyframes are loaded and recognised in a new run, a different room is rejected, short losses recover without a new session, a long loss starts a new world frame, objects are placed on the object and not the wall behind it, repeat sightings merge into one row, directions and obstacle warnings are right, people can be remembered, recognised (with stand-in faces) and forgotten, and `what is ahead` lists the right things. It uses temporary files, so your database and position file are never touched. It uses random noise, so a run that misses a limit by a hair can happen. Run it again before assuming something is broken.
+It takes a few minutes. It builds a synthetic room with a virtual camera that turns and swings, runs the tracker, and checks the result against the truth. It passes when the final status is `tracking`, path error is under 6% of path length, heading error is under 8 degrees and the median map error is under 0.4 units. It then checks the logic: saved keyframes are loaded and recognised in a new run, a different room is rejected, short losses recover without a new session, a long loss starts a new world frame, objects are placed on the object and not the wall behind it, repeat sightings merge into one row, directions and obstacle warnings are right (including objects beside and behind within 1 m), people can be remembered, recognised (with stand-in faces) and forgotten, and `what is ahead` lists the right things. It uses temporary files, so your database and position file are never touched. It uses random noise, so a run that misses a limit by a hair can happen. Run it again before assuming something is broken.
 
 ### Results so far (pilot, one developer, one room, webcam plus one iPhone)
 
@@ -345,6 +345,7 @@ A real tape check: use A4 sheets, long side 29.7 cm (1 sheet = 0.297 m, 2 = 0.59
 - **Different cameras do not share maps.** A map made with the webcam is not used by the phone, and the reverse.
 - **Object positions are approximate**, and objects of the same label within about 0.75 m are merged into one.
 - **Obstacle warnings only cover objects the camera has already seen**, and only the obstacle-sized classes. They are advisory, not a safety system.
+- **The 1 m warning is 360 degrees, but the camera is not.** The phone camera sees only about a 60 to 70 degree slice in front. Things beside or behind you are known only if the camera saw them earlier, and the map may be out of date if they moved. Something that appears beside or behind you for the first time is not detected. The 360 degree warning has been tested on simulated data only, not yet with real objects around a person.
 - **Detection is only as good as YOLOv8n.** Wrong labels still happen, even at confidence 0.6 (for example bed, dog or couch), and one object can get several labels.
 - **Vibration alerts do not work on iPhone.** iOS browsers do not support web vibration, so the phone page beeps instead. Vibration is not yet tested on Android.
 - **Saved-map joins vary between runs** (1 of 3 in an earlier round, 3 of 3 in the latest). See the results table for look-alike rooms.
@@ -375,7 +376,7 @@ A real tape check: use A4 sheets, long side 29.7 cm (1 sheet = 0.297 m, 2 = 0.59
 
 ## 8. Roadmap
 
-- Test learning mode on a real phone against a tape, check the beep on iPhone and vibration on Android, and measure the warning latency and the "person ahead" warning.
+- Test learning mode on a real phone against a tape, check the beep on iPhone and vibration on Android, and measure the warning latency and the nearby-person warning, including objects beside and behind.
 - Measure accuracy against a tape in a real room and report it here.
 - Test the join across two real runs and the phone pipeline on real devices.
 - A scale that needs no tape measure (for example from the phone's motion sensors or known object sizes), so a blind user can use it alone.

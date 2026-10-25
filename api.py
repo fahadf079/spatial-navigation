@@ -205,13 +205,16 @@ class PhonePipeline:
     def running(self):
         return self.thread is not None and self.thread.is_alive()
 
-    def notify(self, text, speak=True, learn=None):
+    def notify(self, text, speak=True, learn=None, alert=False):
         """A short message for the phone. speak=False: show it but do not say it (limited speech).
-        learn: 'done', 'failed' or 'skipped' on the message that ends learning mode."""
+        learn: 'done', 'failed' or 'skipped' on the message that ends learning mode.
+        alert=True: an obstacle warning, so the page beeps or vibrates."""
         with self._event_lock:
             event = {'text': text, 'speak': bool(speak)}
             if learn:
                 event['learn'] = learn
+            if alert:
+                event['alert'] = True
             self.events.append((self.next_event, event))
             self.next_event += 1
 
@@ -402,7 +405,7 @@ function handleEvent(ev){
   if(ev.learn){ learnState = ev.learn; }
   $('lastmsg').textContent = t;
   if(ev.speak === false) return;                       // limited speech: shown, not spoken
-  say(t, /ahead|obstacle|lost/i.test(t));
+  say(t, ev.alert === true || /ahead|obstacle|lost/i.test(t));   // obstacle warnings carry alert=true
 }
 function onMotion(e){
   const a = e.accelerationIncludingGravity;

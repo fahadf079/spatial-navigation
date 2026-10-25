@@ -13,7 +13,7 @@
     python live_run.py --model yolov8s.pt      use a bigger, more accurate (slower) YOLO model
     python live_run.py --new                   do not look for the previous map; start a fresh one
     python live_run.py --map 17                continue the saved map of session 17
-    python live_run.py --speak                 say warnings out loud (tracking lost, obstacle ahead...)
+    python live_run.py --speak                 say warnings out loud (tracking lost, obstacle within 1 m...)
     python live_run.py --no-faces              never try to recognise faces
 
 By default a run first looks for the most recently saved map for a few seconds. If you aim the
@@ -179,22 +179,26 @@ def draw_overlay(frame, vo, status, points_saved, detections_saved, boxes, bad_f
         cv2.putText(frame, message, (10, h - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.55, RED, 2)
 
 
-def _takes_speak(fn):
-    """True if the notify function accepts a speak=... argument (older ones take only the text)."""
+def _takes_arg(fn, name):
+    """True if the notify function accepts a name=... argument (older ones take only the text)."""
     if fn is None:
         return False
     try:
         params = inspect.signature(fn).parameters
     except (TypeError, ValueError):
         return False
-    return 'speak' in params or any(p.kind == p.VAR_KEYWORD for p in params.values())
+    return name in params or any(p.kind == p.VAR_KEYWORD for p in params.values())
+
+
+def _takes_speak(fn):
+    return _takes_arg(fn, 'speak')
 
 
 def run(save_map=True, detect=True, source=0, show=True, max_frames=None, detector=None,
         conf=MIN_CONFIDENCE, dshow=False, ignore=IGNORE_LABELS, model='yolov8n.pt', resume='auto',
         K=None, state=None, notify=None, face_engine=None, use_faces=True):
     """state: optional dict updated every frame. notify: optional function(text) that receives
-    short spoken-style messages (tracking lost, obstacle ahead...)."""
+    short spoken-style messages (tracking lost, obstacle within 1 m...)."""
     if K is None:
         K = np.load(CALIB_FILE)['camera_matrix']
     conn = connect()
@@ -243,10 +247,12 @@ def run(save_map=True, detect=True, source=0, show=True, max_frames=None, detect
     live_objs, live_time = [], 0.0       # what the last detection pass saw (people included)
 
     notify_takes_speak = _takes_speak(notify)
+    notify_takes_alert = _takes_arg(notify, 'alert')
 
-    def event(text, key=None, gap=8.0, speak=True):
+    def event(text, key=None, gap=8.0, speak=True, alert=False):
         """Send a short message. speak=False marks it as information to show but not say out loud
-        (limited speech: only warnings and answers are spoken)."""
+        (limited speech: only warnings and answers are spoken). alert=True marks an obstacle warning,
+        so the phone can beep or vibrate (the spoken line itself no longer says "ahead")."""
         if notify is None:
             return
         key = key or text
@@ -254,7 +260,9 @@ def run(save_map=True, detect=True, source=0, show=True, max_frames=None, detect
         if now - last_event.get(key, 0) < gap:
             return
         last_event[key] = now
-        if not speak and notify_takes_speak:
+        if alert and notify_takes_alert:
+            notify(text, alert=True)
+        elif not speak and notify_takes_speak:
             notify(text, speak=False)
         else:
             notify(text)
@@ -372,7 +380,7 @@ def run(save_map=True, detect=True, source=0, show=True, max_frames=None, detect
             scale, scale_measured = effective_scale(conn, session_id)
             scale_frame = frame_idx
 
-        # Warn about things within about 1 m straight ahead (stored objects and people seen just now).
+        # Warn about anything within about 1 m in ANY direction (360 degrees): stored objects and people seen just now.
         if notify is not None and status == 'tracking' and not searching and frame_idx % 15 == 0:
             items = [{'label': o['label'], 'position': o['position'], 'say': o['label']} for o in objects]
             if time.time() - live_time < 3.0:
@@ -381,7 +389,7 @@ def run(save_map=True, detect=True, source=0, show=True, max_frames=None, detect
             if alerts:
                 name, dist, angle, kind = alerts[0]
                 # limited speech: the object and its distance in one short line, no direction
-                event(warning_line(name, dist / scale), f'obstacle-{name}', 6)
+                event(warning_line(name, dist / scale), f'obstacle-{name}', 6, alert=True)
 
         new_kfs = vo.drain_new_keyframes()
         new_points = np.empty((0, 3)) if relocated_now else vo.new_points

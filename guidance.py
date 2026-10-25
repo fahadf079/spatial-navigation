@@ -1,9 +1,10 @@
 """Directions to a stored object or person, "what is ahead" answers and obstacle warnings.
 Used by navigate.py, voice.py, api.py and live_run.py.
 
-"Ahead" means in a straight line in front of the camera, within about 1 m, relative to the
-camera's current rotation and angle (the pilot is a phone in a front pocket looking forward).
-Positions are approximate (the pilot target is about 1 m), so answers say so.
+A warning means anything known within about 1 m of the camera in ANY direction (a full 360 degrees,
+not only straight ahead). The camera itself only sees forward, so things beside or behind you are
+known only from what it saw earlier. Left, right and behind are worked out from the camera's current
+rotation. Positions are approximate (the pilot target is about 1 m), so answers say so.
 Everything here only reads the database and the live files.
 """
 import datetime
@@ -19,8 +20,7 @@ STRAIGHT_DEG = 10          # closer than this to the heading counts as "straight
 BEHIND_DEG = 120           # farther than this: "turn around"
 CORRIDOR_METERS = 0.5      # an object this close to the straight path is an obstacle
 END_MARGIN_METERS = 0.3    # ignore things right next to the target itself
-ALERT_METERS = 1.0         # "ahead" means within about 1 m in a straight line
-ALERT_FOV_DEG = 25         # ... for objects this close to straight ahead
+ALERT_METERS = 1.0         # a warning means anything known within about 1 m, in any direction (360 degrees)
 LIMITED_SPEECH = True      # spoken answers are one short line (object and distance); the full text is still printed
 POSITION_MAX_AGE_SECONDS = 4.0   # a position older than this means the camera program is not running
 
@@ -67,8 +67,10 @@ def _cap(text):
 
 
 def warning_line(name, meters):
-    """The one spoken line for an obstacle warning: the object and its distance, nothing else."""
-    return f'{_cap(name)} ahead, {meters:.1f} meters'
+    """The one spoken line for an obstacle warning: the object and its distance, nothing else.
+
+    No "ahead": a warning now covers every direction around you."""
+    return f'{_cap(name)}, {meters:.1f} meters'
 
 
 def _singular(word):
@@ -151,10 +153,12 @@ def find_obstacles(rows, target_id, C, X, R, scale, limit=2):
 
 
 def obstacles_ahead(objects, C, R, scale, only_obstacles=True, meters=ALERT_METERS):
-    """Things in front of the camera within `meters` and ALERT_FOV_DEG of straight ahead.
+    """Everything known within `meters` of the camera, in any direction (360 degrees).
 
     objects: dicts with 'label', 'position' (map units) and optionally 'say' (what to call it,
-    for example a person's name). Returns [(name, distance in map units, angle)], nearest first.
+    for example a person's name). Returns [(name, distance in map units, angle, label)], nearest
+    first. The angle is the horizontal bearing from straight ahead (right is positive, beyond
+    120 degrees means behind you). Distance is the straight-line distance in 3D.
     """
     if not scale:
         return []
@@ -167,11 +171,8 @@ def obstacles_ahead(objects, C, R, scale, only_obstacles=True, meters=ALERT_METE
         if dist > meters * scale or dist < 1e-6:
             continue
         cam = R @ v
-        if cam[2] <= 0:
-            continue
         angle = math.degrees(math.atan2(cam[0], cam[2]))
-        if abs(angle) <= ALERT_FOV_DEG:
-            out.append((dist, obj.get('say') or obj['label'], angle, obj['label']))
+        out.append((dist, obj.get('say') or obj['label'], angle, obj['label']))
     out.sort()
     return [(name, dist, angle, label) for dist, name, angle, label in out]
 
@@ -277,18 +278,18 @@ def _ahead(conn):
     found = obstacles_ahead(scene_items(conn, session), C, R, scale, only_obstacles=False)
     lines, spoken = [], []
     for name, dist, angle, _label in found[:4]:
-        side = side_text(angle)
-        lines.append(f'{name}, about {_dist_text(dist, scale)} ahead' + (f', {side}' if side else ''))
-        spoken.append(f'{name}, {_dist_text(dist, scale)}' + (f', {side}' if side else ''))
+        where = side_text(angle) or 'straight ahead'
+        lines.append(f'{name}, about {_dist_text(dist, scale)}, {where}')
+        spoken.append(f'{name}, {_dist_text(dist, scale)}, {where}')
     if found:
-        text = 'Within about 1 m ahead: ' + '; '.join(lines) + '.' + _scale_note(measured)
-        say = 'Ahead: ' + '; '.join(spoken) + '.'
+        text = 'Within about 1 m around you: ' + '; '.join(lines) + '.' + _scale_note(measured)
+        say = 'Around you: ' + '; '.join(spoken) + '.'
         short = f'{_cap(found[0][0])}, {_spoken_distance(found[0][1], scale, measured)}.'
     else:
-        text = ('Nothing known within about 1 m straight ahead. I only know what the camera has already seen.'
-                + _scale_note(measured))
-        say = 'Nothing known within one meter ahead.'
-        short = 'Nothing known ahead.'
+        text = ('Nothing known within about 1 m in any direction. I only know what the camera has already seen, '
+                'and it only looks forward.' + _scale_note(measured))
+        say = 'Nothing known within one meter.'
+        short = 'Nothing known within one meter.'
     return {'found': True, 'text': text, 'spoken': say, 'short': short}
 
 

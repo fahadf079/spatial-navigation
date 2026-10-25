@@ -254,6 +254,24 @@ def run_logic_checks():
                                         np.zeros(3), np.eye(3), 5.0)
         ok &= check('only a close, large object in front triggers a warning',
                     len(near) == 1 and near[0][0] == 'chair', f'{len(near)} warnings')
+        # 360 degrees: 1 m = 5 map units; the camera looks along +z, x is to the right
+        around = guidance.obstacles_ahead(
+            [{'label': 'chair', 'position': np.array([0.0, 0, 4.0])},     # 0.8 m straight ahead
+             {'label': 'couch', 'position': np.array([4.0, 0, 0.5])},     # 0.8 m to the right
+             {'label': 'bed', 'position': np.array([-3.0, 0, -3.0])},     # 0.85 m behind, to the left
+             {'label': 'chair', 'position': np.array([0.0, 0, -9.0])},    # 1.8 m behind: too far
+             {'label': 'chair', 'position': np.array([5.0, 0, 5.0])}],    # 1.4 m diagonal: too far
+            np.zeros(3), np.eye(3), 5.0)
+        ok &= check('warnings cover all directions within 1 m: ahead, beside and behind, nearest first',
+                    [a[0] for a in around] == ['chair', 'couch', 'bed'] and abs(around[2][2]) > guidance.BEHIND_DEG,
+                    str([(a[0], round(a[2])) for a in around]))
+        spun = guidance.obstacles_ahead([{'label': 'chair', 'position': np.array([0.0, 0, 4.0])}],
+                                        np.zeros(3), np.array([[-1.0, 0, 0], [0, 1, 0], [0, 0, -1]]), 5.0)
+        ok &= check('turning around does not hide an object (it is now behind you)',
+                    len(spun) == 1 and abs(spun[0][2]) > guidance.BEHIND_DEG)
+        ok &= check('no scale means no warnings (distance unknown)',
+                    guidance.obstacles_ahead([{'label': 'chair', 'position': np.array([0.0, 0, 1.0])}],
+                                             np.zeros(3), np.eye(3), None) == [])
 
         # 8. two whole runs through live_run: the second one joins the first one's map
         import live_run
