@@ -310,10 +310,11 @@ Anything not listed here has **not been measured**. Scale values from different 
 | Test | Result | Status |
 |---|---|---|
 | `selftest.py` (simulated room) | Passed twice earlier. Turn heading error 2.0 degrees, swing 1.4 degrees. Run again before each release. | Measured |
-| Scale repeatability (0.5 m move, 3 runs per session) | Session 42: 3.775, 4.413, 4.182 (spread about 17%, pass). Session 43: 13.294, 10.097 (about 30% apart, fail). Session 62: 0.197, 0.289, 0.146 (the script flagged them as unusual, about 2 times apart, fail). Session 41: 4.363, 4.620 (a third attempt was discarded). | Measured. Passed in 1 session, failed in 2 |
+| Scale repeatability (0.5 m move, 3 or more runs per session) | Session 63: 16.760, 17.560, 15.430, 16.394 (4 runs, spread about 14%, pass). Session 42: 3.775, 4.413, 4.182 (spread about 17%, pass). Session 43: 13.294, 10.097 (about 30% apart, fail). Session 62: 0.197, 0.289, 0.146 (the script flagged them as unusual, about 2 times apart, fail). Session 41: 4.363, 4.620 (a third attempt was discarded). | Measured. Passed in 2 sessions, failed in 2 |
 | Early scale attempt at 0.1 m (session 39) | 10.971, 3.633, 23.471. The move was too short and the camera was rotated, so this method is not valid. | Measured, invalid method |
 | Accuracy, first attempt (session 43) | Tape 0.4, 0.8, 1.2 m. System said 0.20, 0.20, 0.38 m. Errors 0.20, 0.60, 0.82 m. The scale in that session was not repeatable and the distances were short, so this is not conclusive. | Inconclusive |
 | Accuracy, redo (session 62) | System distances 10.40, 8.77 and 2.85 m for laptop to chair, chair to phone and laptop to phone. Tape values entered: 0.3 m (first run) and 0.5 m (second run) for each pair. Errors 2.35 to 10.10 m, all failed. The scale in that session was 0.146 units per meter (flagged as unusual, and the three runs ranged from 0.146 to 0.289), so this is a scale failure, not a measure of tracker accuracy. | Failed, scale unreliable |
+| Accuracy, clean redo (session 63) | Scale of 16.39 units per meter set in the same session (4 runs, see above). Chair to bed: tape 0.8 m, system 0.44 m, error 0.36 m. Bed to laptop: tape 0.6 m, system 0.60 m, error 0.00 m. Both are within the 1.0 m bar. This is only 2 pairs, both short, well below the planned 6 pairs, and the stored position of the chair moved about 0.4 m between two readings as it was seen again, so a single small error is not proof of 1 m accuracy. | Measured, partial (2 of 6 planned pairs) |
 | Saved-map join | Found the saved map in 3 of 3 tries (session 51). The first map was small (283 points) and grew each try (3, 4, then 13 views). An earlier round gave 1 of 3. | Measured |
 | Identical rooms |  | **Not measured** |
 | Faces | Enrolled person named correctly 10 of 10. Strangers given a name 0 of 10. One enrolled person, normal indoor light, counted from the camera window. | Measured, small sample |
@@ -321,7 +322,7 @@ Anything not listed here has **not been measured**. Scale values from different 
 | Phone: vibration | Not supported by iOS browsers, and only an iPhone was available. To be checked on Android. | Not testable on iPhone |
 | Phone: pocket walk |  | **Not measured** |
 | Obstacle warnings |  | **Not measured** |
-| Tracking stability | Session 60 (phone): 3 lost events. Session 62 (laptop, handheld): 13 lost events. Tracking recovered each time without starting a new session. | Measured, weak |
+| Tracking stability | Session 60 (phone): 3 lost events. Session 62 (laptop, handheld): 13 lost events. Session 63 (laptop): 3 lost events. Tracking recovered each time without starting a new session in sessions 60, 62 and 63. In session 64 tracking was lost for too long once and a new map was started (session 65). | Measured, weak |
 
 **Planned tests and pass bars:**
 
