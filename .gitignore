@@ -12,3 +12,4 @@ current_position.json.tmp
 live_scene.json
 __pycache__/
 *.pyc
+last_scan.json

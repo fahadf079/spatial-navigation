@@ -86,6 +86,8 @@ class FaceEngine:
     """Finds faces in a picture and turns each one into a 128-number description."""
 
     def __init__(self, model_dir=None, download=_download):
+        if os.environ.get('SN_DISABLE_FACES') == '1':       # cloud server: faces stay on the local computer
+            raise FaceUnavailable('face recognition is turned off on this server (SN_DISABLE_FACES=1)')
         paths = ensure_models(model_dir, download)
         try:
             self.detector = cv2.FaceDetectorYN.create(paths['detector'], '', (320, 320), DETECT_SCORE, 0.3, 50)

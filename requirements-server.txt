@@ -1,0 +1,7 @@
+# For the cloud server (Render). Installed by render-build.sh after a CPU-only PyTorch.
+# The laptop and the phone-over-Wi-Fi setup keep using requirements.txt.
+ultralytics
+numpy
+fastapi
+uvicorn[standard]
+opencv-python-headless

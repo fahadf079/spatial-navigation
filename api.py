@@ -38,14 +38,18 @@ from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnec
 from fastapi.responses import HTMLResponse, PlainTextResponse
 
 import guidance
+import lookaround
 import motion
 from tracker import connect, get_units_per_meter, read_position
 
 PHONE_FOCAL_FACTOR = 0.8   # focal length ~ 0.8 x the longer image side (typical phone main camera)
+PHONE_FOCAL_FACTORS = {'wide': PHONE_FOCAL_FACTOR,   # normal lens, about 65 degrees across
+                       'ultrawide': 0.38}           # ultra-wide lens, about 105 degrees across (an estimate)
 CERT_DIR = os.path.join(os.path.expanduser('~'), '.spatial_navigation')
 
 app = FastAPI(title='Spatial Navigation')
-TOKEN = None               # set in phone mode: pages and the camera socket need ?key=...
+TOKEN = None               # set in phone and server mode: pages and the camera socket need ?key=...
+SERVER_MODE = False        # --server: runs in the cloud behind the host's https (see render.yaml)
 
 
 # ------------------------------------------------------------------ data endpoints
@@ -56,16 +60,28 @@ def _newest_session(conn):
 
 @app.middleware('http')
 async def guard(request, call_next):
-    if not TOKEN:
-        return await call_next(request)
-    given = request.query_params.get('key') or request.cookies.get('key')
-    if given != TOKEN:
+    if not TOKEN or request.method == 'OPTIONS' or request.url.path == '/health':
+        return await call_next(request)                 # health checks and CORS preflights carry no key
+    given = request.query_params.get('key') or request.headers.get('x-access-key') or request.cookies.get('key') or ''
+    if not secrets.compare_digest(given.encode(), TOKEN.encode()):
         return PlainTextResponse('Open the link printed in the computer window (it includes ?key=...).',
                                  status_code=403)
     response = await call_next(request)
     if request.query_params.get('key') == TOKEN:
-        response.set_cookie('key', TOKEN, httponly=True, samesite='lax')
+        response.set_cookie('key', TOKEN, httponly=True, samesite='lax', secure=SERVER_MODE)
     return response
+
+
+def configure_cors(origins):
+    """Let a frontend served from another address call this server (call before the first request).
+
+    origins: exact origins such as 'https://my-frontend.onrender.com', or ['*']. The frontend sends the
+    access key as ?key=... or in an X-Access-Key header. No origins listed: same-address use only."""
+    from fastapi.middleware.cors import CORSMiddleware
+    origins = [o.strip() for o in origins if o and o.strip()]
+    if origins:
+        app.add_middleware(CORSMiddleware, allow_origins=origins, allow_methods=['GET', 'OPTIONS'],
+                           allow_headers=['x-access-key', 'content-type'], allow_credentials=False)
 
 
 @app.get('/status')
@@ -113,6 +129,9 @@ def detections(session: int | None = None, label: str | None = None, all: bool =
         item = {'id': id_, 'label': lab, 'confidence': conf, 'x': x, 'y': y, 'z': z,
                 'pos_source': source, 'session_id': sid, 'timestamp': ts,
                 'legacy': not sid, 'units_per_meter': scale}
+        age = guidance.age_seconds(ts)
+        item['age_seconds'] = age                      # how long ago it was last seen
+        item['fresh'] = guidance.is_fresh(age)
         if scale:
             item['meters'] = {'x': x / scale, 'y': y / scale, 'z': z / scale}
         out.append(item)
@@ -135,6 +154,13 @@ def pointcloud(session: int | None = None, limit: int = Query(5000, ge=1, le=100
 @app.get('/navigate')
 def navigate(query: str = Query(..., min_length=1, max_length=200)):
     """Directions with obstacle warnings (same logic as navigate.py and voice.py)."""
+    if lookaround.LOOK_AROUND.search(query):               # "look around": turn once to refresh what is known
+        if PIPE.running:
+            started = PIPE.scan.start()                    # the phone hears the instructions as an event
+            return {'query': query, 'found': started, 'spoken': '', 'short': '',
+                    'text': 'Look around started.' if started else 'Could not start look around.'}
+        text = 'Start the phone camera first, then say look around.'
+        return {'query': query, 'found': False, 'text': text, 'spoken': text, 'short': text}
     answer = guidance.describe(query)
     return {'query': query, **answer}
 
@@ -200,6 +226,8 @@ class PhonePipeline:
         self.error = None
         self.resume = 'auto'       # continue the latest saved map if the phone recognises the place
         self.learner = motion.LearningController(self.notify, read_position, _measured_scale, _store_scale)
+        self.lens = 'wide'         # the phone camera the page opened: 'wide' (normal) or 'ultrawide'
+        self.scan = lookaround.ScanController(self.notify, read_position, lambda: self.lens)
 
     @property
     def running(self):
@@ -244,16 +272,26 @@ class PhonePipeline:
                 self.learner.cancel()
         elif kind == 'motion_unavailable':
             self.learner.on_unavailable()
+        elif kind == 'camera':                             # which lens the page opened (sent before the first frame)
+            lens = msg.get('lens')
+            if isinstance(lens, str) and lens in PHONE_FOCAL_FACTORS and not self.running:
+                self.lens = lens
+        elif kind == 'scan':
+            if msg.get('action') == 'start':
+                self.scan.start()
+            elif msg.get('action') == 'cancel':
+                self.scan.cancel()
 
     def start(self, first_frame):
         import live_run                                     # heavy imports only when needed
         h, w = first_frame.shape[:2]
-        f = PHONE_FOCAL_FACTOR * max(w, h)
+        f = PHONE_FOCAL_FACTORS.get(self.lens, PHONE_FOCAL_FACTOR) * max(w, h)
         K = np.array([[f, 0, w / 2], [0, f, h / 2], [0, 0, 1.0]])
         self.source = FrameQueueSource()
         self.state = {'status': 'starting'}
         self.error = None
         self.learner.reset()
+        self.scan.reset()
 
         def target():
             try:
@@ -274,9 +312,16 @@ class PhonePipeline:
             self.thread.join(timeout=5)
         self.state = {'status': 'idle'}
         self.learner.reset()
+        self.scan.reset()
 
 
 PIPE = PhonePipeline()
+
+
+@app.get('/health')
+def health():
+    """For the host's health check and for a frontend: needs no key and shows nothing private."""
+    return {'ok': True, 'pipeline': PIPE.state.get('status', 'idle')}
 
 
 @app.get('/events')
@@ -289,7 +334,8 @@ def events(since: int = 0):
 async def camera(ws: WebSocket):
     import asyncio
     await ws.accept()
-    if TOKEN and ws.query_params.get('key') != TOKEN and ws.cookies.get('key') != TOKEN:
+    if TOKEN and not any(secrets.compare_digest((given or '').encode(), TOKEN.encode())
+                         for given in (ws.query_params.get('key'), ws.cookies.get('key'))):
         await ws.close(code=1008)
         return
     if PIPE.running and PIPE.source is not None and not PIPE.source.closed:
@@ -319,6 +365,7 @@ async def camera(ws: WebSocket):
                     break
                 await asyncio.sleep(0.05)
             PIPE.learner.tick()
+            PIPE.scan.tick()
             texts, last_event = PIPE.events_since(last_event)
             await ws.send_json({'state': PIPE.state, 'events': texts, 'error': PIPE.error})
     except WebSocketDisconnect:
@@ -356,6 +403,8 @@ video{width:100%;border-radius:8px;background:#000}
     <label>Your height in cm (optional) <input type="text" id="height" inputmode="numeric" style="width:4em"></label>
     <label><input type="checkbox" id="beep"> Beep on warnings</label>
     <button id="alerttest" class="off">Test alert</button> <span id="rtt"></span>
+    <br><label>Lens <select id="lens"><option value="wide">Normal (tested)</option><option value="ultrawide">Ultra-wide (new, not field-tested)</option></select></label>
+    <span id="lensinfo"></span> <button id="scanbtn" class="off">Look around</button>
   </div>
   <div id="lastmsg" class="note"></div>
   <div id="warn" class="lost"></div>
@@ -370,15 +419,15 @@ video{width:100%;border-radius:8px;background:#000}
 <div class="note">Try: "what is ahead", "take me to the chair", "who is Ahmed", "remember this person as Ahmed, my brother",
 "remember that Sara is my friend", "who do you know", "forget Ahmed".</div>
 <h3>Objects in this session</h3>
-<table id="objs"><tr><th>Object</th><th>Where (m, or map units)</th><th>Conf</th></tr></table>
+<table id="objs"><tr><th>Object</th><th>Where (m, or map units)</th><th>Conf</th><th>Seen</th></tr></table>
 <div id="pocket">Pocket mode is on.<br>Say a command, for example "what is ahead".<br>Hold here for 2 seconds to stop.</div>
 <script>
 const CAMERA = __CAMERA__;
 const $ = id => document.getElementById(id);
-const COMMAND = /\b(where|take me|guide|find|who|what|remember|learn|learning mode|calibrat\w*|forget|list|ahead|front|next|clear|anyone|anything|this person|stop)\b/i;
+const COMMAND = /\b(where|take me|guide|find|who|what|remember|learn|learning mode|calibrat\w*|look around|forget|list|ahead|front|next|clear|anyone|anything|this person|stop)\b/i;
 let pocket = false, speaking = false, recog = null, wakeLock = null, ws = null, stream = null, running = false, stopping = false, lastSent = 0;
 
-let audioCtx = null, trackStatus = 'idle', trackSearching = false, learnActive = false, learnState = '', motionAvail = false, motionOn = false;
+let lens = 'wide', audioCtx = null, trackStatus = 'idle', trackSearching = false, learnActive = false, learnState = '', motionAvail = false, motionOn = false;
 let motionBuf = [], sentAt = 0, rttAvg = 0, rttMax = 0;
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 async function waitFor(test, ms){
@@ -476,12 +525,22 @@ function showState(s){
     + (s.points!==undefined ? ' &nbsp; points '+s.points : '')
     + (s.searching ? ' &nbsp; (looking for saved map)' : '');
 }
+function seenCell(o){
+  if(o.age_seconds === null || o.age_seconds === undefined) return '';
+  if(o.fresh) return '<span class="tracking">fresh</span>';
+  const s = o.age_seconds, t = s < 60 ? Math.round(s)+' s' : s < 3600 ? Math.round(s/60)+' min' : Math.round(s/3600)+' h';
+  return '<span class="lost">old</span> '+t;
+}
+function startScan(){
+  if(!ws || ws.readyState !== 1){ say('The camera is not running.'); return; }
+  ws.send(JSON.stringify({type:'scan', action:'start'}));
+}
 async function poll(){
   try{
     if(!CAMERA || !ws){ const r = await fetch('/status'); if(r.ok){ const p = await r.json(); showState({status:p.status,x:p.x,y:p.y,z:p.z}); } }
     const d = await (await fetch('/detections?limit=100')).json();
-    const rows = d.map(o => '<tr><td>'+o.label+'</td><td>'+(o.meters ? o.meters.x.toFixed(2)+', '+o.meters.y.toFixed(2)+', '+o.meters.z.toFixed(2)+' m' : o.x.toFixed(1)+', '+o.y.toFixed(1)+', '+o.z.toFixed(1))+'</td><td>'+o.confidence.toFixed(2)+'</td></tr>').join('');
-    $('objs').innerHTML = '<tr><th>Object</th><th>Where (m, or map units)</th><th>Conf</th></tr>' + rows;
+    const rows = d.map(o => '<tr><td>'+o.label+'</td><td>'+(o.meters ? o.meters.x.toFixed(2)+', '+o.meters.y.toFixed(2)+', '+o.meters.z.toFixed(2)+' m' : o.x.toFixed(1)+', '+o.y.toFixed(1)+', '+o.z.toFixed(1))+'</td><td>'+o.confidence.toFixed(2)+'</td><td>'+seenCell(o)+'</td></tr>').join('');
+    $('objs').innerHTML = '<tr><th>Object</th><th>Where (m, or map units)</th><th>Conf</th><th>Seen</th></tr>' + rows;
   }catch(e){}
 }
 setInterval(poll, 1500); poll();
@@ -491,12 +550,14 @@ async function ask(text){
   $('q').value = text;
   if(/^(stop|stop listening|goodbye|stop camera)\W*$/i.test(text)){ say('Stopping.'); stopAll(); return; }
   if(/\b(calibrat\w*|learning mode)\b/i.test(text)){ startLearning(); return; }
+  if(/\blook (all )?(around|round)\b|\bscan (the )?(room|area|surroundings)\b/i.test(text)){ startScan(); return; }
   try{
     const a = await (await fetch('/navigate?query='+encodeURIComponent(text))).json();
-    $('answer').textContent = a.text; say(a.spoken, /warning|ahead/i.test(a.spoken) && /obstacle/i.test(a.spoken));
+    $('answer').textContent = a.text; if(a.spoken) say(a.spoken, /warning|ahead/i.test(a.spoken) && /obstacle/i.test(a.spoken));
   }catch(e){ say('I could not reach the computer.'); }
 }
 $('ask').onclick = () => ask();
+$('scanbtn').onclick = startScan;
 $('q').addEventListener('keydown', e => { if(e.key==='Enter') ask(); });
 $('mic').onclick = () => {
   const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
@@ -514,9 +575,27 @@ if(CAMERA){
     c.getContext('2d').drawImage(v, 0, 0);
     c.toBlob(b => { if(b && ws && ws.readyState === 1){ sentAt = performance.now(); ws.send(b); flushMotion(); } }, 'image/jpeg', 0.7);
   }
+  const CAM = {video:{facingMode:'environment', width:{ideal:640}, height:{ideal:480}}, audio:false};
+  async function openCamera(){
+    const first = await navigator.mediaDevices.getUserMedia(CAM);       // asks permission; device names appear after it
+    lens = 'wide'; $('lensinfo').textContent = '';
+    if($('lens').value !== 'ultrawide') return first;
+    let devices = [];
+    try{ devices = (await navigator.mediaDevices.enumerateDevices()).filter(d => d.kind === 'videoinput'); }catch(e){}
+    const ultra = devices.find(d => /ultra/i.test(d.label));            // iPhone: "Back Ultra Wide Camera"
+    if(!ultra){ $('lensinfo').textContent = 'No ultra-wide camera found here, using the normal lens.'; return first; }
+    first.getTracks().forEach(t => t.stop());
+    try{
+      const s = await navigator.mediaDevices.getUserMedia({video:{deviceId:{exact:ultra.deviceId}, width:{ideal:640}, height:{ideal:480}}, audio:false});
+      lens = 'ultrawide'; $('lensinfo').textContent = 'Ultra-wide lens.'; return s;
+    }catch(e){
+      $('lensinfo').textContent = 'Ultra-wide camera would not open, using the normal lens.';
+      return await navigator.mediaDevices.getUserMedia(CAM);
+    }
+  }
   function connect(){
     ws = new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+'/ws/camera');
-    ws.onopen = sendFrame;
+    ws.onopen = () => { ws.send(JSON.stringify({type:'camera', lens: lens})); sendFrame(); };   // the lens first, then frames
     ws.onmessage = e => {
       const m = JSON.parse(e.data);
       if(m.error){ $('warn').textContent = m.error; }
@@ -557,7 +636,7 @@ if(CAMERA){
     const wantLearn = $('learnmode').checked;
     const gotMotion = wantLearn ? await enableMotion() : false;       // first thing in the tap: iPhones ask permission here
     try{
-      stream = await navigator.mediaDevices.getUserMedia({video:{facingMode:'environment', width:{ideal:640}, height:{ideal:480}}, audio:false});
+      stream = await openCamera();
     }catch(e){ $('warn').textContent = 'Camera not available: '+e.message; return; }
     $('v').srcObject = stream; await $('v').play();
     if(wantLearn && gotMotion){
@@ -649,11 +728,32 @@ if __name__ == '__main__':
     import uvicorn
     parser = argparse.ArgumentParser()
     parser.add_argument('--phone', action='store_true', help='accept a phone camera over Wi-Fi (https)')
+    parser.add_argument('--server', action='store_true',
+                        help='cloud mode (Render): plain http behind the host\'s https, key from ACCESS_KEY, port from PORT')
     parser.add_argument('--port', type=int, default=None)
     parser.add_argument('--phone-new', action='store_true',
                         help='phone runs always start a fresh map instead of looking for the saved one')
     args = parser.parse_args()
-    if not args.phone:
+    if args.server:
+        TOKEN = os.environ.get('ACCESS_KEY', '').strip()
+        if len(TOKEN) < 16:
+            raise SystemExit('Set the ACCESS_KEY environment variable to a long random value (at least 16 characters).')
+        SERVER_MODE = True
+        data_dir = os.environ.get('SN_DATA_DIR', '').strip()      # a persistent disk, if the host has one
+        if data_dir:
+            import tracker
+            os.makedirs(data_dir, exist_ok=True)
+            tracker.DB_PATH = os.path.join(data_dir, 'spatial_memory.db')
+            tracker.POSITION_FILE = os.path.join(data_dir, 'current_position.json')
+            tracker.LIVE_SCENE_FILE = os.path.join(data_dir, 'live_scene.json')
+            lookaround.LAST_SCAN_FILE = os.path.join(data_dir, 'last_scan.json')
+        configure_cors((os.environ.get('ALLOWED_ORIGINS') or '').split(','))
+        if args.phone_new or os.environ.get('SN_RESUME') == 'new':
+            PIPE.resume = 'new'
+        port = int(os.environ.get('PORT') or args.port or 10000)
+        print(f'Server mode on port {port}. The access key comes from ACCESS_KEY and is never printed.')
+        uvicorn.run(app, host='0.0.0.0', port=port, proxy_headers=True, forwarded_allow_ips='*')
+    elif not args.phone:
         print('Dashboard: http://127.0.0.1:8000   (add --phone to use a phone camera)')
         uvicorn.run(app, host='127.0.0.1', port=args.port or 8000)
     else:

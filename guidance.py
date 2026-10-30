@@ -13,6 +13,7 @@ import re
 
 import numpy as np
 
+import lookaround
 import people
 from tracker import connect, effective_scale, read_live_scene, read_position
 
@@ -23,6 +24,8 @@ END_MARGIN_METERS = 0.3    # ignore things right next to the target itself
 ALERT_METERS = 1.0         # a warning means anything known within about 1 m, in any direction (360 degrees)
 LIMITED_SPEECH = True      # spoken answers are one short line (object and distance); the full text is still printed
 POSITION_MAX_AGE_SECONDS = 4.0   # a position older than this means the camera program is not running
+FRESH_SECONDS = 20.0       # an object seen within this long ago is "fresh"; anything older is "old"
+SPEAK_AGE = False          # True: the spoken line adds ", old" for objects not seen recently (needs the boss's OK)
 
 # Objects big enough to be in the way (COCO labels).
 OBSTACLE_LABELS = {
@@ -152,13 +155,14 @@ def find_obstacles(rows, target_id, C, X, R, scale, limit=2):
     return found[:limit]
 
 
-def obstacles_ahead(objects, C, R, scale, only_obstacles=True, meters=ALERT_METERS):
+def obstacles_around(objects, C, R, scale, only_obstacles=True, meters=ALERT_METERS):
     """Everything known within `meters` of the camera, in any direction (360 degrees).
 
     objects: dicts with 'label', 'position' (map units) and optionally 'say' (what to call it,
-    for example a person's name). Returns [(name, distance in map units, angle, label)], nearest
+    for example a person's name) and 'age' (seconds since it was last seen). Returns dicts with
+    'name', 'dist' (3D straight-line distance in map units), 'angle', 'label' and 'age', nearest
     first. The angle is the horizontal bearing from straight ahead (right is positive, beyond
-    120 degrees means behind you). Distance is the straight-line distance in 3D.
+    120 degrees means behind you).
     """
     if not scale:
         return []
@@ -172,31 +176,65 @@ def obstacles_ahead(objects, C, R, scale, only_obstacles=True, meters=ALERT_METE
             continue
         cam = R @ v
         angle = math.degrees(math.atan2(cam[0], cam[2]))
-        out.append((dist, obj.get('say') or obj['label'], angle, obj['label']))
-    out.sort()
-    return [(name, dist, angle, label) for dist, name, angle, label in out]
+        out.append({'dist': dist, 'name': obj.get('say') or obj['label'], 'angle': angle,
+                    'label': obj['label'], 'age': obj.get('age')})
+    out.sort(key=lambda d: (d['dist'], d['name'], d['angle'], d['label']))
+    return out
+
+
+def obstacles_ahead(objects, C, R, scale, only_obstacles=True, meters=ALERT_METERS):
+    """Same as obstacles_around, as [(name, distance in map units, angle, label)] (used by live_run.py)."""
+    return [(d['name'], d['dist'], d['angle'], d['label'])
+            for d in obstacles_around(objects, C, R, scale, only_obstacles, meters)]
+
+
+def age_seconds(timestamp):
+    """Seconds since an ISO time stamp, or None if it cannot be read."""
+    try:
+        return max(0.0, (datetime.datetime.now() - datetime.datetime.fromisoformat(timestamp)).total_seconds())
+    except (TypeError, ValueError):
+        return None
+
+
+def is_fresh(age):
+    return age is not None and age <= FRESH_SECONDS
+
+
+def age_tag(age):
+    """'fresh', or 'old, seen 3 min ago'; '' when the age is unknown."""
+    if age is None:
+        return ''
+    return 'fresh' if is_fresh(age) else 'old, seen ' + lookaround.age_words(age)
+
+
+def _fresher(a, b):
+    known = [x for x in (a, b) if x is not None]
+    return min(known) if known else None
 
 
 def scene_items(conn, session):
     """Everything known to be around: stored objects, people seen just now, and the live view."""
-    items = [{'label': label, 'position': np.array([x, y, z], float), 'say': label}
-             for label, x, y, z in conn.execute(
-                 'SELECT label, x, y, z FROM detections WHERE session_id = ?', (session,))]
-    for name, who, x, y, z in people.recent_seen(conn, session):
+    items = [{'label': label, 'position': np.array([x, y, z], float), 'say': label, 'age': age_seconds(ts)}
+             for label, x, y, z, ts in conn.execute(
+                 'SELECT label, x, y, z, timestamp FROM detections WHERE session_id = ?', (session,))]
+    for name, who, x, y, z in people.recent_seen(conn, session):         # only people seen a moment ago
         items.append({'label': 'person', 'position': np.array([x, y, z], float),
-                      'say': name + (f', {people.speak_who(who)}' if who else '')})
+                      'say': name + (f', {people.speak_who(who)}' if who else ''), 'age': 0.0})
     scene = read_live_scene()
     if scene.get('session_id') == session:
         for it in scene['items']:
             if it.get('name'):
                 continue                         # a recognised person is already listed above
             items.append({'label': it['label'], 'position': np.array([it['x'], it['y'], it['z']], float),
-                          'say': it['label']})
+                          'say': it['label'], 'age': 0.0})              # in the live view right now
     unique = []
-    for it in items:                             # the same thing seen twice counts once
-        if not any(u['say'] == it['say'] and np.linalg.norm(u['position'] - it['position']) < 0.5
-                   for u in unique):
+    for it in items:                             # the same thing seen twice counts once (the fresher time wins)
+        match = next((u for u in unique if u['say'] == it['say']
+                      and np.linalg.norm(u['position'] - it['position']) < 0.5), None)
+        if match is None:
             unique.append(it)
+        else:
+            match['age'] = _fresher(match.get('age'), it.get('age'))
     return unique
 
 
@@ -275,19 +313,25 @@ def _ahead(conn):
     scale, measured = effective_scale(conn, session)
     R = np.array(pos['rotation'], float)
     C = np.array([pos['x'], pos['y'], pos['z']], float)
-    found = obstacles_ahead(scene_items(conn, session), C, R, scale, only_obstacles=False)
+    found = obstacles_around(scene_items(conn, session), C, R, scale, only_obstacles=False)
+    note = ' ' + lookaround.coverage_note(session)
+
+    def old_word(d):                                     # spoken only when SPEAK_AGE is on
+        return ', old' if SPEAK_AGE and d['age'] is not None and not is_fresh(d['age']) else ''
+
     lines, spoken = [], []
-    for name, dist, angle, _label in found[:4]:
-        where = side_text(angle) or 'straight ahead'
-        lines.append(f'{name}, about {_dist_text(dist, scale)}, {where}')
-        spoken.append(f'{name}, {_dist_text(dist, scale)}, {where}')
+    for d in found[:4]:
+        where = side_text(d['angle']) or 'straight ahead'
+        tag = age_tag(d['age'])
+        lines.append(f"{d['name']}, about {_dist_text(d['dist'], scale)}, {where}" + (f', {tag}' if tag else ''))
+        spoken.append(f"{d['name']}, {_dist_text(d['dist'], scale)}, {where}" + old_word(d))
     if found:
-        text = 'Within about 1 m around you: ' + '; '.join(lines) + '.' + _scale_note(measured)
+        text = 'Within about 1 m around you: ' + '; '.join(lines) + '.' + _scale_note(measured) + note
         say = 'Around you: ' + '; '.join(spoken) + '.'
-        short = f'{_cap(found[0][0])}, {_spoken_distance(found[0][1], scale, measured)}.'
+        short = f"{_cap(found[0]['name'])}, {_spoken_distance(found[0]['dist'], scale, measured)}{old_word(found[0])}."
     else:
         text = ('Nothing known within about 1 m in any direction. I only know what the camera has already seen, '
-                'and it only looks forward.' + _scale_note(measured))
+                'and it only looks forward.' + _scale_note(measured) + note)
         say = 'Nothing known within one meter.'
         short = 'Nothing known within one meter.'
     return {'found': True, 'text': text, 'spoken': say, 'short': short}
